@@ -1,0 +1,42 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  build-and-test:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Compile with strict C11 warnings
+        run: |
+          if [ "${{ runner.os }}" = "Linux" ]; then
+            make CFLAGS="-std=c11 -O3 -U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=3 -Wall -Wextra -Werror"
+          else
+            make CFLAGS="-std=c11 -O3 -Wall -Wextra -Werror"
+          fi
+      - name: Run C trigram and structural slicer test suite
+        run: make test
+      - name: Verify Python PEP 517 package build and CLI entrypoints
+        run: |
+          python3 -m venv /tmp/hslice-venv
+          /tmp/hslice-venv/bin/pip install --upgrade pip setuptools wheel
+          /tmp/hslice-venv/bin/pip install .
+          /tmp/hslice-venv/bin/hslice --version
+          /tmp/hslice-venv/bin/hfind --version
+          /tmp/hslice-venv/bin/hsearch --version
+
+  security-audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run hshield supply-chain & repository trap audit
+        uses: Hephaestus-Zero/hshield@v0.2.0
+        with:
+          path: .
+          scan-artifacts: 'true'

@@ -1,0 +1,3 @@
+include LICENSE README.md Makefile
+recursive-include src *.c *.h
+recursive-include python *.py

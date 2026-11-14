@@ -1,0 +1,63 @@
+name: release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  build-release:
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu-latest
+            artifact: hslice-linux-x86_64.tar.gz
+          - os: macos-latest
+            artifact: hslice-macos-arm64.tar.gz
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build release binaries
+        run: |
+          if [ "${{ runner.os }}" = "Linux" ]; then
+            make CFLAGS="-std=c11 -O3 -U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=3 -Wall -Wextra -Werror"
+          else
+            make CFLAGS="-std=c11 -O3 -Wall -Wextra -Werror"
+          fi
+          make test
+          strip hslice hfind
+      - name: Package tarball
+        run: |
+          mkdir -p dist
+          tar -czf "dist/${{ matrix.artifact }}" hslice hfind hsearch LICENSE README.md integrations
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: dist/${{ matrix.artifact }}
+
+  publish-release:
+    needs: build-release
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Generate SHA256SUMS and upload GitHub Release assets
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          cd dist
+          sha256sum *.tar.gz > SHA256SUMS
+          TAG="${GITHUB_REF_NAME}"
+          if gh release view "${TAG}" >/dev/null 2>&1; then
+            gh release upload "${TAG}" *.tar.gz SHA256SUMS --clobber
+          else
+            gh release create "${TAG}" *.tar.gz SHA256SUMS \
+              --title "hslice ${TAG}" \
+              --generate-notes
+          fi

@@ -1,0 +1,10 @@
+hslice
+hfind
+hsearch
+*.o
+dist/
+build/
+*.egg-info/
+__pycache__/
+.pytest_cache/
+python/hslice_py/_csrc/

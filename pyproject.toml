@@ -1,0 +1,43 @@
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "hslice"
+version = "0.1.0"
+description = "Sub-2ms C11 mmap trigram indexer & structural AST code slicer for AI coding agents"
+readme = "README.md"
+requires-python = ">=3.9"
+license = {text = "MIT"}
+authors = [
+  {name = "Hephaestus-Zero", email = "326907217+Hephaestus-Zero@users.noreply.github.com"}
+]
+keywords = ["code-search", "ast", "trigram", "ai-agents", "claude-code", "developer-tools"]
+classifiers = [
+  "Development Status :: 4 - Beta",
+  "Environment :: Console",
+  "Intended Audience :: Developers",
+  "License :: OSI Approved :: MIT License",
+  "Operating System :: POSIX :: Linux",
+  "Operating System :: MacOS",
+  "Programming Language :: C",
+  "Programming Language :: Python :: 3",
+  "Topic :: Software Development",
+]
+
+[project.urls]
+Homepage = "https://github.com/Hephaestus-Zero/hslice"
+Repository = "https://github.com/Hephaestus-Zero/hslice"
+Issues = "https://github.com/Hephaestus-Zero/hslice/issues"
+
+[project.scripts]
+hslice = "hslice_py:run_hslice"
+hfind = "hslice_py:run_hfind"
+hsearch = "hslice_py:run_hsearch"
+
+[tool.setuptools]
+package-dir = {"" = "python"}
+include-package-data = true
+
+[tool.setuptools.packages.find]
+where = ["python"]
