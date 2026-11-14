@@ -10,7 +10,7 @@ import shutil
 import subprocess
 import sys
 
-__version__ = "0.1.1"
+__version__ = "0.2.0"
 _SOURCES = ("hslice_common.h", "hfind.c", "hslice.c")
 
 
@@ -80,7 +80,7 @@ def _ensure_binaries() -> Path:
 def _exec_tool(tool_name: str) -> None:
     bin_dir = _ensure_binaries()
     target = str(bin_dir / tool_name)
-    os.execv(target, [tool_name, *sys.argv[1:]])
+    os.execv(target, [target, *sys.argv[1:]])
 
 
 def run_hslice() -> None:

@@ -1,8 +1,10 @@
 import os
 from pathlib import Path
+import re
 import shutil
 import subprocess
 import tempfile
+import time
 import unittest
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -257,6 +259,153 @@ class TestHSliceEngine(unittest.TestCase):
             )
             self.assertIn("REFS (compute_packet_crc", xr_grep.stdout)
             self.assertIn("(void)compute_packet_crc", xr_grep.stdout)
+
+    def test_05_zero_daemon_lazy_mtime_auto_refresh(self) -> None:
+        with tempfile.TemporaryDirectory() as cache_dir, tempfile.TemporaryDirectory() as repo:
+            root = Path(repo)
+            self._create_sample_repo(root)
+            env = dict(os.environ)
+            env["HSLICE_CACHE_DIR"] = cache_dir
+
+            c_file = root / "pkg" / "packet.c"
+            py_file = root / "pkg" / "router.py"
+
+            # 1. Initial slice populates hsym.idx
+            c_init = subprocess.run(
+                [str(HSLICE_BIN), "--root", repo, "compute_packet_crc"],
+                env=env,
+                capture_output=True,
+                text=True,
+                check=True,
+            )
+            m_init = re.search(r"=== .+?:(\d+)-(\d+) \[fn compute_packet_crc\] ===", c_init.stdout)
+            self.assertIsNotNone(m_init)
+            orig_c_start, orig_c_end = int(m_init.group(1)), int(m_init.group(2))
+
+            py_init = subprocess.run(
+                [str(HSLICE_BIN), "--root", repo, "route_payment"],
+                env=env,
+                capture_output=True,
+                text=True,
+                check=True,
+            )
+            m_py_init = re.search(r"=== .+?:(\d+)-(\d+) \[fn route_payment\] ===", py_init.stdout)
+            self.assertIsNotNone(m_py_init)
+            orig_py_start, orig_py_end = int(m_py_init.group(1)), int(m_py_init.group(2))
+
+            # 2. Insert 15 lines above compute_packet_crc in packet.c & 12 lines above OrderRouter in router.py
+            c_prefix = "\n".join(f"/* inserted header padding line {i} */" for i in range(15)) + "\n"
+            c_file.write_text(c_prefix + C_FIXTURE, encoding="utf-8")
+
+            py_prefix = "\n".join(f"# inserted python padding line {i}" for i in range(12)) + "\n"
+            py_extra_fn = "\n\ndef newly_added_validator(token: str) -> bool:\n    return len(token) > 3\n"
+            py_file.write_text(py_prefix + PYTHON_FIXTURE + py_extra_fn, encoding="utf-8")
+
+            future_ts = time.time() + 3.0
+            os.utime(c_file, (future_ts, future_ts))
+            os.utime(py_file, (future_ts, future_ts))
+
+            # 3. Query WITHOUT -r / --rebuild: lazy stat().st_mtime > built_epoch must self-heal
+            c_shifted = subprocess.run(
+                [str(HSLICE_BIN), "--root", repo, "compute_packet_crc"],
+                env=env,
+                capture_output=True,
+                text=True,
+                check=True,
+            )
+            m_shift = re.search(r"=== .+?:(\d+)-(\d+) \[fn compute_packet_crc\] ===", c_shifted.stdout)
+            self.assertIsNotNone(m_shift)
+            self.assertEqual(int(m_shift.group(1)), orig_c_start + 15)
+            self.assertEqual(int(m_shift.group(2)), orig_c_end + 15)
+            self.assertIn("/* Comment with stray braces", c_shifted.stdout)
+            self.assertIn("return acc;", c_shifted.stdout)
+            self.assertNotIn("helper_caller", c_shifted.stdout)
+
+            py_shifted = subprocess.run(
+                [str(HSLICE_BIN), "--root", repo, "route_payment"],
+                env=env,
+                capture_output=True,
+                text=True,
+                check=True,
+            )
+            m_py_shift = re.search(r"=== .+?:(\d+)-(\d+) \[fn route_payment\] ===", py_shifted.stdout)
+            self.assertIsNotNone(m_py_shift)
+            self.assertEqual(int(m_py_shift.group(1)), orig_py_start + 12)
+            self.assertEqual(int(m_py_shift.group(2)), orig_py_end + 12)
+            self.assertIn("@staticmethod", py_shifted.stdout)
+            self.assertIn("raise ValueError", py_shifted.stdout)
+            self.assertNotIn("dispatch_worker", py_shifted.stdout)
+
+            # Brand-new function in the modified file is also indexed now without -r
+            new_fn_slice = subprocess.run(
+                [str(HSLICE_BIN), "--root", repo, "newly_added_validator"],
+                env=env,
+                capture_output=True,
+                text=True,
+                check=True,
+            )
+            self.assertIn("def newly_added_validator", new_fn_slice.stdout)
+            self.assertIn("return len(token) > 3", new_fn_slice.stdout)
+
+    def test_06_audit_receipt_metrics_and_flags(self) -> None:
+        with tempfile.TemporaryDirectory() as cache_dir, tempfile.TemporaryDirectory() as repo:
+            root = Path(repo)
+            self._create_sample_repo(root)
+            env = dict(os.environ)
+            env["HSLICE_CACHE_DIR"] = cache_dir
+
+            # Audit fixture repository via --audit <dir>
+            audit_fixture = subprocess.run(
+                [str(HSLICE_BIN), "--audit", repo],
+                env=env,
+                capture_output=True,
+                text=True,
+                check=True,
+            )
+            out = audit_fixture.stdout
+            self.assertIn("hslice audit", out)
+            self.assertIn("github.com/Hephaestus-Zero/hslice", out)
+            self.assertIn("─", out)
+            self.assertNotIn("\u2014", out)
+            self.assertNotIn("\u2013", out)
+
+            m_all = re.search(r"all ([\d,]+) indexed symbols?\s+([\d,]+)\s+([\d,]+)\s+([\d.]+)%", out)
+            self.assertIsNotNone(m_all, f"Missing aggregate line in:\n{out}")
+            n_syms = int(m_all.group(1).replace(",", ""))
+            file_tok = int(m_all.group(2).replace(",", ""))
+            slice_tok = int(m_all.group(3).replace(",", ""))
+            saved_pct = float(m_all.group(4))
+
+            self.assertGreaterEqual(n_syms, 8)
+            self.assertGreater(file_tok, slice_tok)
+            self.assertGreater(slice_tok, 0)
+            expected_pct = 100.0 * (file_tok - slice_tok) / file_tok
+            self.assertAlmostEqual(saved_pct, expected_pct, delta=0.15)
+
+            m_footer = re.search(r"context saved: ([\d.]+)%  ·  density: ([\d.]+)x  ·  elapsed: ([\d.]+) ms", out)
+            self.assertIsNotNone(m_footer, f"Missing summary metrics in:\n{out}")
+            self.assertAlmostEqual(float(m_footer.group(1)), saved_pct, places=1)
+            self.assertGreater(float(m_footer.group(2)), 1.5)
+
+            # Audit hslice repository itself via -A
+            audit_self = subprocess.run(
+                [str(HSLICE_BIN), "-A", str(REPO_ROOT)],
+                env=env,
+                capture_output=True,
+                text=True,
+                check=True,
+            )
+            self.assertIn("hslice audit  hslice", audit_self.stdout)
+            self.assertIn("context saved:", audit_self.stdout)
+
+            # Nonexistent directory returns non-zero cleanly
+            bad_dir = subprocess.run(
+                [str(HSLICE_BIN), "--audit", str(root / "does_not_exist")],
+                env=env,
+                capture_output=True,
+                text=True,
+            )
+            self.assertNotEqual(bad_dir.returncode, 0)
 
 
 if __name__ == "__main__":

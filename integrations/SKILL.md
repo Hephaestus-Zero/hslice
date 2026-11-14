@@ -3,7 +3,7 @@ name: hslice
 description: Sub-2ms AST/structural code slicer and trigram search engine (hslice, hfind, hsearch). Use instead of multi-step find/grep/read loops to inspect exact functions, traceback lines, file outlines, and callers in a single call with ~88% fewer context tokens.
 ---
 
-# `hslice` — Single-Shot Structural Code Slicer
+# `hslice`: Single-Shot Structural Code Slicer
 
 Replace multi-turn `find -> grep -> read entire file -> grep callers` workflows with one call:
 

@@ -1,5 +1,5 @@
 /*
- * hslice.c — Sub-2ms AST/Structural Code Slicer & Single-Shot Recon Engine
+ * hslice.c - Sub-2ms AST/Structural Code Slicer & Single-Shot Recon Engine
  *
  * Collapses 4-8 sequential agent Search/Read turns into ONE sub-2ms call:
  *   1. `hslice <symbol> [symbol2...]`        -> Exact function/class/struct body via mmap index
@@ -7,10 +7,15 @@
  *   3. `hslice <file>:<start>-<end>`         -> Exact numbered line slice
  *   4. `hslice -s <file>` (`--skeleton`)     -> Structural file outline (~90% fewer tokens)
  *   5. `hslice -x <symbol> [dir]` (`--xref`) -> Definition body + bounded callers/refs in 1 shot
+ *   6. `hslice -A, --audit [dir]`            -> Shareable repo token-savings receipt
+ *
+ * Zero-daemon lazy freshness: matched files with `stat().st_mtime > idx->built_epoch`
+ * trigger an automatic one-shot index rebuild in single-digit ms.
  *
  * Build: cc -std=c11 -O3 -Wall -Wextra -Werror -o hslice src/hslice.c
  */
 #include "hslice_common.h"
+#include <dirent.h>
 #include <sys/mman.h>
 #include <sys/wait.h>
 #include <time.h>
@@ -344,6 +349,7 @@ static void print_slice(const FileLines *fl, const char *path, int start, int en
 typedef struct {
     void *map;
     size_t map_size;
+    uint64_t built_epoch;
     const IndexHeader *hdr;
     const TriBucket *buckets;
     const SymRec *syms;
@@ -352,8 +358,12 @@ typedef struct {
 } MappedSymIdx;
 
 static bool open_sym_index(MappedSymIdx *idx, const char *argv0,
-                           char roots[][PATH_MAX], int n_roots, bool force_rebuild) {
+                           char roots[][PATH_MAX], int n_roots,
+                           bool force_rebuild, bool quiet_rebuild,
+                           bool *did_build_out) {
     memset(idx, 0, sizeof(*idx));
+    if (did_build_out) *did_build_out = false;
+
     char idx_path[PATH_MAX + 128];
     char joined_roots[PATH_MAX * 2];
     if (!hslice_index_path(idx_path, sizeof(idx_path), "hsym",
@@ -365,8 +375,16 @@ static bool open_sym_index(MappedSymIdx *idx, const char *argv0,
     bool need_build = force_rebuild || (stat(idx_path, &st) != 0) ||
                       ((time(NULL) - st.st_mtime) > 3600);
     if (need_build) {
+        if (did_build_out) *did_build_out = true;
         pid_t pid = fork();
         if (pid == 0) {
+            if (quiet_rebuild) {
+                int devnull = open("/dev/null", O_WRONLY);
+                if (devnull >= 0) {
+                    dup2(devnull, STDOUT_FILENO);
+                    close(devnull);
+                }
+            }
             if (argv0 && strchr(argv0, '/') != NULL) {
                 char sibling[PATH_MAX];
                 const char *slash = strrchr(argv0, '/');
@@ -402,6 +420,7 @@ static bool open_sym_index(MappedSymIdx *idx, const char *argv0,
 
     idx->map = map;
     idx->map_size = (size_t)st.st_size;
+    idx->built_epoch = hdr->built_epoch;
     idx->hdr = hdr;
     idx->buckets = (const TriBucket *)((const char *)map + sizeof(IndexHeader));
     idx->syms = (const SymRec *)((const char *)idx->buckets + NUM_TRIGRAMS * sizeof(TriBucket));
@@ -415,6 +434,40 @@ static void close_sym_index(MappedSymIdx *idx) {
         munmap(idx->map, idx->map_size);
     }
     memset(idx, 0, sizeof(*idx));
+}
+
+/* Zero-daemon lazy freshness: check `stat().st_mtime > idx->built_epoch` on disk */
+static bool file_is_stale(const MappedSymIdx *idx, const char *path) {
+    if (!idx || !idx->hdr || !path || !path[0]) return false;
+    struct stat st;
+    if (stat(path, &st) != 0) return true;
+    return ((uint64_t)st.st_mtime > idx->built_epoch);
+}
+
+static bool index_has_any_stale_file(const MappedSymIdx *idx) {
+    if (!idx || !idx->hdr) return false;
+    uint32_t prev_path_off = UINT32_MAX;
+    for (uint32_t i = 0; i < idx->hdr->num_recs; i++) {
+        uint32_t poff = idx->syms[i].path_off;
+        if (poff == prev_path_off) continue;
+        prev_path_off = poff;
+        if (file_is_stale(idx, idx->strs + poff)) return true;
+    }
+    return false;
+}
+
+static bool roots_or_index_stale(const MappedSymIdx *idx, char roots[][PATH_MAX], int n_roots) {
+    for (int r = 0; r < n_roots; r++) {
+        if (file_is_stale(idx, roots[r])) return true;
+    }
+    return index_has_any_stale_file(idx);
+}
+
+static void refresh_sym_index(MappedSymIdx *idx, bool *idx_ok, bool *rebuilt_once,
+                              const char *argv0, char roots[][PATH_MAX], int n_roots) {
+    close_sym_index(idx);
+    *rebuilt_once = true;
+    *idx_ok = (n_roots > 0) && open_sym_index(idx, argv0, roots, n_roots, true, true, NULL);
 }
 
 static size_t gallop_seek(const uint32_t *arr, size_t lo, size_t n, uint32_t target) {
@@ -547,6 +600,30 @@ static int find_symbols(const MappedSymIdx *idx, const char *sym_query, const ch
     for (int i = 0; i < ret; i++) out[i] = cands[i];
     free(cands);
     return ret;
+}
+
+static bool matches_have_stale_file(const MappedSymIdx *idx, const SymMatch *matches, int nm) {
+    for (int i = 0; i < nm; i++) {
+        const SymRec *sr = &idx->syms[matches[i].id];
+        if (file_is_stale(idx, idx->strs + sr->path_off)) return true;
+    }
+    return false;
+}
+
+static int resolve_symbols_lazy(MappedSymIdx *idx, bool *idx_ok, bool *rebuilt_once,
+                                const char *argv0, char roots[][PATH_MAX], int n_roots,
+                                const char *sym_query, const char *file_filter,
+                                SymMatch *out, int max_out) {
+    int nm = (*idx_ok) ? find_symbols(idx, sym_query, file_filter, out, max_out) : 0;
+    if (!*rebuilt_once && *idx_ok) {
+        bool stale = (nm > 0) ? matches_have_stale_file(idx, out, nm)
+                              : roots_or_index_stale(idx, roots, n_roots);
+        if (stale) {
+            refresh_sym_index(idx, idx_ok, rebuilt_once, argv0, roots, n_roots);
+            nm = (*idx_ok) ? find_symbols(idx, sym_query, file_filter, out, max_out) : 0;
+        }
+    }
+    return nm;
 }
 
 typedef struct {
@@ -792,19 +869,430 @@ static void run_xref_refs(const char *sym, const char *scope_dir, const char *de
     (void)waitpid(pid, &st, 0);
 }
 
+/* ==================== REPOSITORY TOKEN AUDIT (`--audit` / `-A`) ==================== */
+
+static bool is_excluded_audit_dir(const char *name) {
+    if (name[0] == '.' && (name[1] == '\0' || (name[1] == '.' && name[2] == '\0')))
+        return true;
+    if (strncmp(name, ".venv", 5) == 0 || strncmp(name, "venv", 4) == 0 ||
+        strncmp(name, "python3.", 8) == 0 ||
+        strstr(name, ".dist-info") != NULL || strstr(name, ".egg-info") != NULL)
+        return true;
+    static const char *const skip[] = {
+        ".git", ".hg", ".svn", "node_modules", "__pycache__", ".cache", "site-packages",
+        ".mypy_cache", ".pytest_cache", ".ruff_cache", ".tox", "target",
+        "vendor", "third_party", "dist", "build", ".next", "out",
+        "coverage", ".pnpm", ".turbo", NULL
+    };
+    for (int i = 0; skip[i]; i++) {
+        if (strcmp(name, skip[i]) == 0) return true;
+    }
+    return false;
+}
+
+static bool is_virtualenv_audit_dir(const char *dir_path) {
+    char cfg[PATH_MAX + 16];
+    int n = snprintf(cfg, sizeof(cfg), "%s/pyvenv.cfg", dir_path);
+    return (n > 0 && (size_t)n < sizeof(cfg) && access(cfg, F_OK) == 0);
+}
+
+static bool dir_has_dist_info_audit(const char *dir_path) {
+    DIR *d = opendir(dir_path);
+    if (!d) return false;
+    struct dirent *de;
+    int dist_cnt = 0;
+    while ((de = readdir(d)) != NULL) {
+        if (strstr(de->d_name, ".dist-info") != NULL && ++dist_cnt >= 3) {
+            closedir(d);
+            return true;
+        }
+    }
+    closedir(d);
+    return false;
+}
+
+static bool is_audit_source_file(const char *name) {
+    if (strstr(name, ".min.") || strstr(name, ".bundle.")) return false;
+    return detect_lang(name) != LANG_GENERIC;
+}
+
+static uint32_t count_source_files_rec(const char *dir, int depth) {
+    if (depth > 18) return 0;
+    bool flat_target = dir_has_dist_info_audit(dir);
+    DIR *d = opendir(dir);
+    if (!d) return 0;
+
+    uint32_t total = 0;
+    uint32_t src_in_dir = 0;
+    struct dirent *de;
+    char child[PATH_MAX];
+    while ((de = readdir(d)) != NULL) {
+        if (is_excluded_audit_dir(de->d_name)) continue;
+        int n = snprintf(child, sizeof(child), "%s/%s", dir, de->d_name);
+        if (n <= 0 || (size_t)n >= sizeof(child)) continue;
+
+        unsigned char dt = DT_UNKNOWN;
+#ifdef DT_DIR
+        dt = de->d_type;
+#endif
+        if (dt == DT_UNKNOWN) {
+            struct stat st;
+            if (lstat(child, &st) == 0) {
+                if (S_ISDIR(st.st_mode)) dt = DT_DIR;
+                else if (S_ISREG(st.st_mode)) dt = DT_REG;
+            }
+        }
+        if (dt == DT_DIR) {
+            if (flat_target || is_virtualenv_audit_dir(child)) continue;
+            total += count_source_files_rec(child, depth + 1);
+        } else if (dt == DT_REG) {
+            if (is_audit_source_file(de->d_name) && ++src_in_dir <= 8192) {
+                total++;
+            }
+        }
+    }
+    closedir(d);
+    return total;
+}
+
+typedef struct {
+    uint32_t sym_id;
+    uint32_t line;
+    uint8_t  kind;
+    uint8_t  is_test;
+    size_t   file_bytes;
+    size_t   slice_bytes;
+    uint64_t file_tokens;
+    uint64_t slice_tokens;
+} AuditSym;
+
+static int audit_sym_tier(const AuditSym *s) {
+    if (s->kind == 0 && !s->is_test) return 2;
+    if (s->kind == 0) return 1;
+    return 0;
+}
+
+static int cmp_audit_largest(const void *a, const void *b) {
+    const AuditSym *sa = (const AuditSym *)a;
+    const AuditSym *sb = (const AuditSym *)b;
+    int ta = audit_sym_tier(sa);
+    int tb = audit_sym_tier(sb);
+    if (ta != tb) return tb - ta;
+    if (sa->slice_bytes != sb->slice_bytes) {
+        return (sb->slice_bytes > sa->slice_bytes) - (sb->slice_bytes < sa->slice_bytes);
+    }
+    if (sa->file_bytes != sb->file_bytes) {
+        return (sb->file_bytes > sa->file_bytes) - (sb->file_bytes < sa->file_bytes);
+    }
+    return (sa->sym_id > sb->sym_id) - (sa->sym_id < sb->sym_id);
+}
+
+static void format_u64_commas(uint64_t v, char *out, size_t cap) {
+    char raw[32];
+    int n = snprintf(raw, sizeof(raw), "%" PRIu64, v);
+    if (n <= 0 || cap == 0) {
+        if (cap > 0) out[0] = '\0';
+        return;
+    }
+    int commas = (n - 1) / 3;
+    size_t total = (size_t)(n + commas);
+    if (total + 1 > cap) {
+        snprintf(out, cap, "%s", raw);
+        return;
+    }
+    out[total] = '\0';
+    int src = n - 1;
+    int dst = (int)total - 1;
+    int grp = 0;
+    while (src >= 0) {
+        out[dst--] = raw[src--];
+        if (++grp == 3 && src >= 0) {
+            out[dst--] = ',';
+            grp = 0;
+        }
+    }
+}
+
+static void truncate_right(const char *src, char *out, size_t width) {
+    size_t len = strlen(src);
+    if (len <= width) {
+        memcpy(out, src, len + 1);
+        return;
+    }
+    if (width <= 2) {
+        memcpy(out, src, width);
+        out[width] = '\0';
+        return;
+    }
+    memcpy(out, src, width - 2);
+    out[width - 2] = '.';
+    out[width - 1] = '.';
+    out[width] = '\0';
+}
+
+static void truncate_left(const char *src, char *out, size_t width) {
+    size_t len = strlen(src);
+    if (len <= width) {
+        memcpy(out, src, len + 1);
+        return;
+    }
+    if (width <= 2) {
+        memcpy(out, src + (len - width), width);
+        out[width] = '\0';
+        return;
+    }
+    out[0] = '.';
+    out[1] = '.';
+    memcpy(out + 2, src + (len - (width - 2)), width - 2);
+    out[width] = '\0';
+}
+
+static void print_hairline(void) {
+    for (int i = 0; i < 78; i++) {
+        fputs("\xe2\x94\x80", stdout);
+    }
+    fputc('\n', stdout);
+}
+
+static int run_audit_mode(const char *argv0, const char *audit_arg, const char *cli_root,
+                          bool force_rebuild) {
+    struct timespec t0, t1;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+
+    char audit_roots[HSLICE_MAX_ROOTS][PATH_MAX];
+    int n_roots = 0;
+    if (audit_arg && audit_arg[0]) {
+        if (!hslice_resolve_dir(audit_arg, audit_roots[0], sizeof(audit_roots[0]))) {
+            fprintf(stderr, "hslice: directory not found: %s\n", audit_arg);
+            return 1;
+        }
+        n_roots = 1;
+    } else {
+        n_roots = hslice_discover_roots(cli_root, audit_roots, HSLICE_MAX_ROOTS);
+        if (n_roots <= 0) {
+            fprintf(stderr, "hslice: failed to resolve workspace directory\n");
+            return 1;
+        }
+    }
+
+    MappedSymIdx idx;
+    bool did_build = false;
+    bool idx_ok = open_sym_index(&idx, argv0, audit_roots, n_roots, force_rebuild, true, &did_build);
+    bool rebuilt = force_rebuild || did_build;
+    if (idx_ok && !rebuilt && roots_or_index_stale(&idx, audit_roots, n_roots)) {
+        refresh_sym_index(&idx, &idx_ok, &rebuilt, argv0, audit_roots, n_roots);
+    }
+    if (!idx_ok) {
+        fprintf(stderr, "hslice: failed to index symbols in %s\n", audit_roots[0]);
+        return 1;
+    }
+
+    uint32_t walked_files = 0;
+    for (int r = 0; r < n_roots; r++) {
+        walked_files += count_source_files_rec(audit_roots[r], 0);
+    }
+
+    uint32_t n_recs = idx.hdr->num_recs;
+    AuditSym *items = malloc((size_t)(n_recs ? n_recs : 1) * sizeof(AuditSym));
+    if (!items) {
+        close_sym_index(&idx);
+        return 1;
+    }
+
+    uint32_t n_items = 0;
+    uint32_t unique_idx_files = 0;
+    uint64_t all_file_tok = 0;
+    uint64_t all_slice_tok = 0;
+
+    FileLines cur_fl = {0};
+    uint32_t cur_path_off = UINT32_MAX;
+    bool cur_fl_ok = false;
+    bool cur_is_test = false;
+    SliceLang cur_lang = LANG_GENERIC;
+
+    for (uint32_t i = 0; i < n_recs; i++) {
+        const SymRec *sr = &idx.syms[i];
+        if (sr->path_off != cur_path_off) {
+            free_file_lines(&cur_fl);
+            cur_path_off = sr->path_off;
+            const char *p = idx.strs + cur_path_off;
+            cur_fl_ok = load_file_lines(p, &cur_fl);
+            cur_lang = cur_fl_ok ? detect_lang(p) : LANG_GENERIC;
+            const char *base = strrchr(p, '/');
+            base = base ? (base + 1) : p;
+            cur_is_test = (strstr(p, "/tests/") != NULL || strncmp(base, "test_", 5) == 0);
+            if (cur_fl_ok) unique_idx_files++;
+        }
+        if (!cur_fl_ok || cur_fl.raw_len == 0) continue;
+
+        int s_ln = 0, e_ln = 0;
+        compute_symbol_bounds(&cur_fl, cur_lang, (int)sr->line, &s_ln, &e_ln);
+        if (s_ln < 1) s_ln = 1;
+        if (e_ln > cur_fl.count) e_ln = cur_fl.count;
+        if (e_ln < s_ln) e_ln = s_ln;
+
+        size_t s_bytes = 0;
+        for (int ln = s_ln; ln <= e_ln; ln++) {
+            s_bytes += strlen(cur_fl.lines[ln - 1]) + 1;
+        }
+        if (s_bytes > cur_fl.raw_len) s_bytes = cur_fl.raw_len;
+        if (s_bytes == 0) s_bytes = 1;
+
+        uint64_t f_tok = (uint64_t)((cur_fl.raw_len + 3) / 4);
+        uint64_t s_tok = (uint64_t)((s_bytes + 3) / 4);
+        if (s_tok > f_tok) s_tok = f_tok;
+
+        items[n_items].sym_id = i;
+        items[n_items].line = sr->line;
+        items[n_items].kind = sr->kind;
+        items[n_items].is_test = cur_is_test ? 1 : 0;
+        items[n_items].file_bytes = cur_fl.raw_len;
+        items[n_items].slice_bytes = s_bytes;
+        items[n_items].file_tokens = f_tok;
+        items[n_items].slice_tokens = s_tok;
+        n_items++;
+
+        all_file_tok += f_tok;
+        all_slice_tok += s_tok;
+    }
+    free_file_lines(&cur_fl);
+
+    if (n_items > 1) {
+        qsort(items, (size_t)n_items, sizeof(AuditSym), cmp_audit_largest);
+    }
+
+    uint32_t total_files = (walked_files >= unique_idx_files) ? walked_files : unique_idx_files;
+    uint32_t top_n = (n_items < 8U) ? n_items : 8U;
+
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    double elapsed_ms = (double)(t1.tv_sec - t0.tv_sec) * 1e3 +
+                        (double)(t1.tv_nsec - t0.tv_nsec) / 1e6;
+
+    const char *repo_base = strrchr(audit_roots[0], '/');
+    repo_base = (repo_base && repo_base[1]) ? (repo_base + 1) : audit_roots[0];
+    size_t root0_len = strlen(audit_roots[0]);
+
+    char files_buf[32], syms_buf[32];
+    format_u64_commas(total_files, files_buf, sizeof(files_buf));
+    format_u64_commas(n_items, syms_buf, sizeof(syms_buf));
+
+    printf("hslice audit  %s (%s %s, %s %s)\n",
+           repo_base,
+           files_buf, (total_files == 1) ? "file" : "files",
+           syms_buf, (n_items == 1) ? "symbol" : "symbols");
+    print_hairline();
+
+    if (n_items == 0) {
+        printf("0 indexed symbols found in %s\n", audit_roots[0]);
+        print_hairline();
+        printf("context saved: 0.0%%  \xc2\xb7  density: 1.0x  \xc2\xb7  elapsed: %.1f ms\n"
+               "github.com/Hephaestus-Zero/hslice\n",
+               elapsed_ms);
+        free(items);
+        close_sym_index(&idx);
+        return 0;
+    }
+
+    printf("%-24s  %-25s %9s %9s %6s\n",
+           "symbol", "location", "file tok", "slice tok", "saved");
+    print_hairline();
+
+    uint64_t sample_file_tok = 0;
+    uint64_t sample_slice_tok = 0;
+    bool all_top_fn = true;
+
+    for (uint32_t k = 0; k < top_n; k++) {
+        const AuditSym *it = &items[k];
+        const SymRec *sr = &idx.syms[it->sym_id];
+        const char *sym_name = idx.strs + sr->sym_off;
+        const char *full_path = idx.strs + sr->path_off;
+        const char *rel_path = full_path;
+        if (strncmp(full_path, audit_roots[0], root0_len) == 0 && full_path[root0_len] == '/') {
+            rel_path = full_path + root0_len + 1;
+        }
+
+        if (it->kind != 0) all_top_fn = false;
+        sample_file_tok += it->file_tokens;
+        sample_slice_tok += it->slice_tokens;
+
+        char sym_col[32];
+        char loc_raw[PATH_MAX + 32];
+        char loc_col[32];
+        char ftok_col[32];
+        char stok_col[32];
+        char pct_col[16];
+
+        truncate_right(sym_name, sym_col, 24);
+        snprintf(loc_raw, sizeof(loc_raw), "%.4096s:%u", rel_path, it->line);
+        truncate_left(loc_raw, loc_col, 25);
+        format_u64_commas(it->file_tokens, ftok_col, sizeof(ftok_col));
+        format_u64_commas(it->slice_tokens, stok_col, sizeof(stok_col));
+
+        double row_saved = (it->file_tokens > 0 && it->file_tokens >= it->slice_tokens)
+            ? (100.0 * (double)(it->file_tokens - it->slice_tokens) / (double)it->file_tokens)
+            : 0.0;
+        snprintf(pct_col, sizeof(pct_col), "%.1f%%", row_saved);
+
+        printf("%-24s  %-25s %9s %9s %6s\n",
+               sym_col, loc_col, ftok_col, stok_col, pct_col);
+    }
+
+    print_hairline();
+
+    if (n_items > top_n) {
+        char sample_lbl[64];
+        char s_ftok[32], s_stok[32], s_pct[16];
+        snprintf(sample_lbl, sizeof(sample_lbl), "sample (top %u largest %s)",
+                 top_n, all_top_fn ? "functions" : "symbols");
+        format_u64_commas(sample_file_tok, s_ftok, sizeof(s_ftok));
+        format_u64_commas(sample_slice_tok, s_stok, sizeof(s_stok));
+        double sample_saved = (sample_file_tok > 0 && sample_file_tok >= sample_slice_tok)
+            ? (100.0 * (double)(sample_file_tok - sample_slice_tok) / (double)sample_file_tok)
+            : 0.0;
+        snprintf(s_pct, sizeof(s_pct), "%.1f%%", sample_saved);
+        printf("%-51s %9s %9s %6s\n", sample_lbl, s_ftok, s_stok, s_pct);
+    }
+
+    char all_lbl[64];
+    char a_ftok[32], a_stok[32], a_pct[16];
+    snprintf(all_lbl, sizeof(all_lbl), "all %s indexed %s",
+             syms_buf, (n_items == 1) ? "symbol" : "symbols");
+    format_u64_commas(all_file_tok, a_ftok, sizeof(a_ftok));
+    format_u64_commas(all_slice_tok, a_stok, sizeof(a_stok));
+    double all_saved = (all_file_tok > 0 && all_file_tok >= all_slice_tok)
+        ? (100.0 * (double)(all_file_tok - all_slice_tok) / (double)all_file_tok)
+        : 0.0;
+    double density_x = (all_slice_tok > 0)
+        ? ((double)all_file_tok / (double)all_slice_tok)
+        : 1.0;
+    snprintf(a_pct, sizeof(a_pct), "%.1f%%", all_saved);
+    printf("%-51s %9s %9s %6s\n", all_lbl, a_ftok, a_stok, a_pct);
+
+    print_hairline();
+    printf("context saved: %.1f%%  \xc2\xb7  density: %.1fx  \xc2\xb7  elapsed: %.1f ms\n"
+           "github.com/Hephaestus-Zero/hslice\n",
+           all_saved, density_x, elapsed_ms);
+
+    free(items);
+    close_sym_index(&idx);
+    return 0;
+}
+
 static void print_usage(void) {
-    printf("hslice v%s — Sub-2ms AST/Structural Code Slicer & Single-Shot Recon\n"
+    printf("hslice v%s: Sub-2ms C11 Structural Code Slicer & Single-Shot Recon\n"
            "Usage:\n"
            "  hslice <symbol> [symbol2 ...] [--root DIR] [-f FILE_FILTER] [-n TOP_DEFS] [-m MAX_LINES]\n"
            "  hslice <file>:<line> [<file2>:<start>-<end> ...]   (batch traceback / range slice)\n"
            "  hslice -s <file>                                   (structural file skeleton)\n"
-           "  hslice -x <symbol> [dir] [--root DIR]              (1-shot definition + callers)\n",
+           "  hslice -x <symbol> [dir] [--root DIR]              (1-shot definition + callers)\n"
+           "  hslice -A, --audit [dir]                           (repo token-savings receipt)\n",
            HSLICE_VERSION);
 }
 
 int main(int argc, char **argv) {
     bool skeleton_mode = false;
     bool xref_mode = false;
+    bool audit_mode = false;
     bool force_rebuild = false;
     const char *file_filter = NULL;
     const char *cli_root = NULL;
@@ -820,6 +1308,8 @@ int main(int argc, char **argv) {
         } else if (strcmp(argv[i], "-x") == 0 || strcmp(argv[i], "--xref") == 0) {
             xref_mode = true;
             top_defs = 1;
+        } else if (strcmp(argv[i], "-A") == 0 || strcmp(argv[i], "--audit") == 0) {
+            audit_mode = true;
         } else if (strcmp(argv[i], "-r") == 0 || strcmp(argv[i], "--rebuild") == 0) {
             force_rebuild = true;
         } else if ((strcmp(argv[i], "-R") == 0 || strcmp(argv[i], "--root") == 0) && i + 1 < argc) {
@@ -844,13 +1334,18 @@ int main(int argc, char **argv) {
         }
     }
 
+    if (audit_mode) {
+        const char *audit_arg = (n_targets >= 1) ? targets[0] : NULL;
+        return run_audit_mode(argv[0], audit_arg, cli_root, force_rebuild);
+    }
+
     char roots[HSLICE_MAX_ROOTS][PATH_MAX];
     int n_roots = hslice_discover_roots(cli_root, roots, HSLICE_MAX_ROOTS);
 
     if (n_targets == 0) {
         if (force_rebuild && n_roots > 0) {
             MappedSymIdx tmp_idx;
-            bool ok = open_sym_index(&tmp_idx, argv[0], roots, n_roots, true);
+            bool ok = open_sym_index(&tmp_idx, argv[0], roots, n_roots, true, false, NULL);
             close_sym_index(&tmp_idx);
             return ok ? 0 : 1;
         }
@@ -859,11 +1354,19 @@ int main(int argc, char **argv) {
     }
 
     MappedSymIdx idx;
-    bool idx_ok = (n_roots > 0) && open_sym_index(&idx, argv[0], roots, n_roots, force_rebuild);
+    bool did_build = false;
+    bool idx_ok = (n_roots > 0) && open_sym_index(&idx, argv[0], roots, n_roots, force_rebuild, true, &did_build);
+    bool rebuilt_once = force_rebuild || did_build;
 
     if (skeleton_mode) {
         int rc = 0;
         for (int i = 0; i < n_targets; i++) {
+            char skel_path[PATH_MAX];
+            if (idx_ok && !rebuilt_once &&
+                resolve_existing_file(targets[i], skel_path, sizeof(skel_path)) &&
+                file_is_stale(&idx, skel_path)) {
+                refresh_sym_index(&idx, &idx_ok, &rebuilt_once, argv[0], roots, n_roots);
+            }
             rc |= run_skeleton_mode(idx_ok ? &idx : NULL, targets[i]);
         }
         close_sym_index(&idx);
@@ -875,7 +1378,8 @@ int main(int argc, char **argv) {
         const char *scope_dir = (n_targets >= 2) ? targets[1] : NULL;
         const char *default_root = (n_roots > 0) ? roots[0] : ".";
         SymMatch matches[2];
-        int nm = idx_ok ? find_symbols(&idx, sym, file_filter, matches, 2) : 0;
+        int nm = resolve_symbols_lazy(&idx, &idx_ok, &rebuilt_once, argv[0],
+                                      roots, n_roots, sym, file_filter, matches, 2);
         if (nm == 0) {
             fprintf(stderr, "hslice: 0 symbol definitions for \"%s\".\n"
                             "NEXT: running body reference search (`hsearch -g`) instead:\n", sym);
@@ -918,13 +1422,19 @@ int main(int argc, char **argv) {
                     exit_rc = 1;
                 }
             } else {
+                if (idx_ok && !rebuilt_once && file_is_stale(&idx, fpath)) {
+                    refresh_sym_index(&idx, &idx_ok, &rebuilt_once, argv[0], roots, n_roots);
+                }
                 slice_enclosing_at_line(idx_ok ? &idx : NULL, fpath, l1, max_lines);
             }
             continue;
         }
 
-        /* Check if user passed bare file path without :line -> show skeleton hint + top 60 lines */
+        /* Check if user passed bare file path without :line -> show skeleton */
         if (resolve_existing_file(targets[t], fpath, sizeof(fpath))) {
+            if (idx_ok && !rebuilt_once && file_is_stale(&idx, fpath)) {
+                refresh_sym_index(&idx, &idx_ok, &rebuilt_once, argv[0], roots, n_roots);
+            }
             run_skeleton_mode(idx_ok ? &idx : NULL, fpath);
             continue;
         }
@@ -937,7 +1447,8 @@ int main(int argc, char **argv) {
         }
 
         SymMatch matches[10];
-        int nm = find_symbols(&idx, targets[t], file_filter, matches, top_defs);
+        int nm = resolve_symbols_lazy(&idx, &idx_ok, &rebuilt_once, argv[0],
+                                      roots, n_roots, targets[t], file_filter, matches, top_defs);
         if (nm == 0) {
             fprintf(stderr, "hslice: 0 symbol definitions matched \"%s\"%s%s.\n"
                             "NEXT: try `hsearch -g \"%s\"` for raw text occurrences or `hfind %s` for filenames.\n",

@@ -589,6 +589,7 @@ typedef struct {
     uint32_t *seen_stamp;
     char *fbuf;
     size_t fbuf_cap;
+    uint64_t max_mtime;
 } SymBuilder;
 
 static void scan_source_file(SymBuilder *sb, const char *path, SrcLang lang) {
@@ -598,6 +599,9 @@ static void scan_source_file(SymBuilder *sb, const char *path, SrcLang lang) {
     if (fstat(fd, &st) != 0 || st.st_size <= 0 || st.st_size > 1048576) {
         close(fd);
         return;
+    }
+    if (st.st_mtime > 0 && (uint64_t)st.st_mtime > sb->max_mtime) {
+        sb->max_mtime = (uint64_t)st.st_mtime;
     }
     size_t sz = (size_t)st.st_size;
     if (sz + 2 > sb->fbuf_cap) {
@@ -749,6 +753,9 @@ static int build_sym_index(const char *idx_path, char roots[][PATH_MAX], int n_r
     int fd = open(tmp_path, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
     if (fd < 0) return -1;
 
+    uint64_t built_ep = (uint64_t)time(NULL);
+    if (sb.max_mtime > built_ep) built_ep = sb.max_mtime;
+
     IndexHeader hdr = {
         .magic = HSYM_MAGIC,
         .version = IDX_VERSION,
@@ -756,7 +763,7 @@ static int build_sym_index(const char *idx_path, char roots[][PATH_MAX], int n_r
         .str_bytes = sb.strs_len,
         .postings_len = (uint32_t)total_postings,
         .pad = 0,
-        .built_epoch = (uint64_t)time(NULL)
+        .built_epoch = built_ep
     };
 
     FILE *out = fdopen(fd, "wb");

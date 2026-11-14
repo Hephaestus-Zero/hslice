@@ -3,7 +3,7 @@ name: hslice
 description: Sub-2ms C11 mmap trigram code indexer and structural AST symbol slicer (hslice, hfind, hsearch) that cuts coding agent file-read tokens by ~94%. Use whenever locating files, searching symbols, reading function/class definitions, inspecting stack traces, or tracing callers instead of grep/find/cat/sed.
 ---
 
-# `hslice` — Single-Shot Structural Code Slicer
+# `hslice`: Single-Shot Structural Code Slicer
 
 Replace multi-turn `find -> grep -> read entire file -> grep callers` loops with one deterministic sub-2ms command:
 
@@ -25,7 +25,11 @@ Replace multi-turn `find -> grep -> read entire file -> grep callers` loops with
    ```bash
    hslice -s <path/to/file>
    ```
-5. **Zero-copy `mmap` trigram path, symbol, and regex lookups**:
+5. **Repository token-savings audit receipt**:
+   ```bash
+   hslice --audit [dir]
+   ```
+6. **Zero-copy `mmap` trigram path, symbol, and regex lookups**:
    ```bash
    hfind <path tokens...>
    hsearch <symbol tokens...>

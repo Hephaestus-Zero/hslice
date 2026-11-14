@@ -1,12 +1,38 @@
-# `hslice` — Sub-2ms C11 Code Slicer & `mmap` Trigram Search for AI Coding Agents
+# `hslice`: Sub-2ms C11 Code Slicer & `mmap` Trigram Search for AI Coding Agents
 
 [![CI](https://github.com/Hephaestus-Zero/hslice/actions/workflows/ci.yml/badge.svg)](https://github.com/Hephaestus-Zero/hslice/actions/workflows/ci.yml)
 [![Release](https://img.shields.io/github/v/release/Hephaestus-Zero/hslice)](https://github.com/Hephaestus-Zero/hslice/releases/latest)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
-`hslice` is a zero-dependency C11 structural code slicer and `mmap` 3-gram index engine (`hslice`, `hfind`, `hsearch`) built for **Claude Code**, **OpenAI Codex**, **Cursor**, **Gemini CLI**, and local developer workflows. Instead of forcing coding agents to spend 4–6 tool turns running `find`, `grep`, and reading entire 1,000-line files into context, `hslice` slices the exact symbol definition, enclosing traceback function, structural skeleton, or definition-plus-callers (`-x`) in **one call** — cutting context token consumption by **93–96%** at **~1.3–2.3 ms** steady-state latency.
+`hslice` is a zero-dependency C11 structural code slicer and `mmap` 3-gram index engine (`hslice`, `hfind`, `hsearch`) built for **Claude Code**, **OpenAI Codex**, **Cursor**, **Gemini CLI**, and local terminal workflows. Instead of burning 4 to 6 tool turns running `find`, `grep`, and reading whole 1,000-line files into context, `hslice` extracts the exact symbol definition, enclosing traceback function, structural skeleton, or definition-plus-callers (`-x`) in **one call**, cutting context token consumption by **93% to 96%** at **~1.3 to 2.3 ms** steady-state latency.
 
 ![hslice animated terminal demo](assets/demo.svg)
+
+## Audit Your Repository in One Command (`hslice --audit`)
+
+Run `hslice --audit .` (or `hslice -A [dir]`) inside any C, C++, Rust, Go, Python, TypeScript, JavaScript, or Java repository to measure exact full-file read tokens versus structural symbol-slice tokens across your codebase:
+
+```text
+$ hslice --audit .
+hslice audit  hslice (7 files, 105 symbols)
+──────────────────────────────────────────────────────────────────────────────
+symbol                    location                   file tok slice tok  saved
+──────────────────────────────────────────────────────────────────────────────
+main                      src/hfind.c:945              11,029     2,738  75.2%
+run_audit_mode            src/hslice.c:1057            13,325     2,124  84.1%
+main                      src/hslice.c:1292            13,325     1,953  85.3%
+extract_symbol_on_line    src/hfind.c:421              11,029     1,578  85.7%
+compute_symbol_bounds     src/hslice.c:170             13,325     1,425  89.3%
+build_sym_index           src/hfind.c:714              11,029       958  91.3%
+find_symbols              src/hslice.c:502             13,325       952  92.9%
+build_path_index          src/hfind.c:258              11,029       864  92.2%
+──────────────────────────────────────────────────────────────────────────────
+sample (top 8 largest functions)                       97,416    12,592  87.1%
+all 105 indexed symbols                               926,685    33,862  96.3%
+──────────────────────────────────────────────────────────────────────────────
+context saved: 96.3%  ·  density: 27.4x  ·  elapsed: 1.4 ms
+github.com/Hephaestus-Zero/hslice
+```
 
 ![hslice token economy and latency benchmark](assets/benchmark.svg)
 
@@ -35,7 +61,7 @@
 
 ## Why Agents Waste Tokens (And How `hslice` Fixes It)
 
-Typical agent code exploration burns four round-trips and floods the context window:
+Standard agent code exploration takes four round-trips and floods the context window:
 1. Locate the file (`find` / glob)
 2. Locate the line (`grep def ...`)
 3. Read the entire source file (`read_file` / `cat`)
@@ -47,16 +73,19 @@ Typical agent code exploration burns four round-trips and floods the context win
 # 1. Single-shot recon: exact definition body + all bounded references in 1 call
 hslice -x cmd_sandbox_impl
 
-# 2. Extract exact function / class / struct by symbol name (~1.3–2.0 ms)
+# 2. Extract exact function / class / struct by symbol name (~1.3 to 2.0 ms)
 hslice validate_pinned_image_ref
 
 # 3. Traceback / stack-trace zoom: pass file:line to extract ONLY its enclosing function
 hslice src/hveritas/repository/verifier.py:452
 
-# 4. Compact structural skeleton (~92–95% fewer tokens than reading the file)
+# 4. Compact structural skeleton (~92% to 95% fewer tokens than reading the file)
 hslice -s src/hshield.c
 
-# 5. Zero-copy mmap path & symbol trigram lookup (~1.3 ms) or bounded regex body search
+# 5. Repository token-savings audit receipt (< 10 ms on typical repos)
+hslice --audit .
+
+# 6. Zero-copy mmap path & symbol trigram lookup (~1.3 ms) or bounded regex body search
 hfind verifier.py
 hsearch run_pytest
 hsearch -g "LANDLOCK_ACCESS_NET"
@@ -81,6 +110,13 @@ SYMBOLS (27):
 ```
 
 </details>
+
+## Zero-Daemon Lazy Freshness (`stat().st_mtime > built_epoch`)
+
+Coding agents edit files mid-session, shifting line numbers below each edit. Instead of running a background `inotify` / FSEvents daemon or requiring git hooks, `hslice` stores `built_epoch` inside the `hsym.idx` header and checks `stat().st_mtime > idx->built_epoch` on matched files at query time:
+
+- **Steady state (unchanged file):** One `stat()` syscall (~1 microsecond) confirms the matched file has not been modified since `built_epoch`. Zero rebuild overhead.
+- **After an edit or file move:** When a matched file is missing or has `st_mtime > built_epoch` (or when a newly added symbol is queried after a workspace edit), `hslice` runs a single-shot index rebuild in single-digit milliseconds and re-resolves exact line bounds automatically, without passing `-r`.
 
 ## Measured Benchmark (Linux `x86_64`, 25-Run Median)
 
@@ -109,7 +145,7 @@ python3 scripts/bench_token_economy.py \
 curl -fsSL https://raw.githubusercontent.com/Hephaestus-Zero/hslice/main/install.sh | sh
 ```
 
-### Option B: Build from Source (`cc` only — zero external libraries)
+### Option B: Build from Source (`cc` only, zero external libraries)
 
 ```bash
 git clone https://github.com/Hephaestus-Zero/hslice.git
@@ -124,13 +160,13 @@ sudo make install   # or: make install PREFIX="$HOME/.local"
 ```bash
 pip install git+https://github.com/Hephaestus-Zero/hslice.git
 # or run ephemerally via uvx (requires C compiler on host):
-uvx --from git+https://github.com/Hephaestus-Zero/hslice.git hslice --version
+uvx --from git+https://github.com/Hephaestus-Zero/hslice.git hslice --audit .
 ```
 
 ### Option D: GitHub Actions
 
 ```yaml
-- uses: Hephaestus-Zero/hslice@v0.1.1
+- uses: Hephaestus-Zero/hslice@v0.2.0
 ```
 
 ## Coding-Agent Drop-In Setup
@@ -146,19 +182,20 @@ curl -fsSL https://raw.githubusercontent.com/Hephaestus-Zero/hslice/main/integra
 ## Architecture & Language Support
 
 - **Two-Pass Counting-Sort `mmap` 3-Gram Index:** `hfind` and `hsearch` pack 6-bit character trigrams into `262,144` direct-mapped buckets (`O(N)` build, galloping sorted posting-list intersection at query time), mapped directly via `mmap(PROT_READ)`.
-- **Automatic Per-Workspace Scoping:** Automatically discovers the enclosing `.git` repository root (or `$PWD`, overridden via `--root <dir1[:dir2]>` or `HSLICE_ROOTS`), storing hashed `.idx` caches per workspace under `$HSLICE_CACHE_DIR` / `$XDG_RUNTIME_DIR/hslice` / `/tmp/hslice-<uid>` so switching repositories never leaks cross-project symbols.
+- **Zero-Daemon Lazy Freshness:** Checks `stat().st_mtime > built_epoch` on matched files and triggers a single-shot rebuild only when edited files outdate the cached `.idx`.
+- **Automatic Per-Workspace Scoping:** Discovers the enclosing `.git` repository root (or `$PWD`, overridden via `--root <dir1[:dir2]>` or `HSLICE_ROOTS`), storing hashed `.idx` caches per workspace under `$HSLICE_CACHE_DIR` / `$XDG_RUNTIME_DIR/hslice` / `/tmp/hslice-<uid>` so switching repositories never leaks cross-project symbols.
 - **Zero-Allocation Structural Slicer:** Language-aware boundary extraction handles Python indentation + `@decorators` + triple-quoted docstrings as well as brace-delimited C, C++, Rust, Go, JavaScript, TypeScript, and Java (ignoring braces inside comments and strings).
-- **Resilient Cross-Reference Fallback:** `hslice -x` and `hsearch -g` invoke `rg` when available and transparently fall back to POSIX `grep -rnE` on minimal Linux/macOS environments.
+- **Resilient Cross-Reference Fallback:** `hslice -x` and `hsearch -g` invoke `rg` when available and fall back to POSIX `grep -rnE` on minimal Linux/macOS environments.
 
 ## Comparison with Alternatives
 
-| Tool | Runtime / Dependencies | Lookup Speed | Structural Body Slicing | Traceback `file:line` | 1-Shot Def + Callers (`-x`) |
+| Tool | Runtime / Dependencies | Lookup Speed | Lazy Index Self-Healing | Structural Body Slicing | 1-Shot Def + Callers (`-x`) |
 |---|---|---|---|---|---|
-| **`hslice` (`+ hfind/hsearch`)** | Single C11 binary (`libc` only) | **~1.3–2.0 ms** | Yes (Py, C/C++, Rust, Go, TS/JS, Java) | Yes | Yes |
-| `ripgrep` + manual `read` | Rust binary + extra agent turns | 10–40 ms | Line match only (needs full file read) | No | Multiple calls |
-| `ctags` + `awk`/`sed` | External binary + custom scripts | ~10–50 ms | Header/tag start line only | No | No |
-| Tree-sitter / LSP MCP | Node/Python/LSP daemon (~100+ MB RAM) | 20–500 ms startup | Heavy AST server | Language-specific | Multi-step |
+| **`hslice` (`+ hfind/hsearch`)** | Single C11 binary (`libc` only) | **~1.3 to 2.0 ms** | Yes (`stat` mtime, 0 daemons) | Yes (Py, C/C++, Rust, Go, TS/JS, Java) | Yes |
+| `ripgrep` + manual `read` | Rust binary + extra agent turns | 10 to 40 ms | N/A (stateless scan) | Line match only (needs full file read) | Multiple calls |
+| `ctags` + `awk`/`sed` | External binary + custom scripts | 10 to 50 ms | Manual regen / git hooks | Header/tag start line only | No |
+| Tree-sitter / LSP MCP | Node/Python/LSP daemon (~100+ MB RAM) | 20 to 500 ms startup | Resident background daemon | Heavy AST server | Multi-step |
 
 ## License
 
-MIT License — Copyright (c) 2026 Hephaestus-Zero.
+MIT License. Copyright (c) 2026 Hephaestus-Zero.
