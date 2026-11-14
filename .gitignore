@@ -1,6 +1,6 @@
-hslice
-hfind
-hsearch
+/hslice
+/hfind
+/hsearch
 *.o
 dist/
 build/
