@@ -1,0 +1,11 @@
+{
+  "name": "hslice",
+  "description": "Sub-2ms C11 mmap trigram code indexer and structural AST symbol slicer that cuts coding agent file-read tokens by ~94%",
+  "version": "0.1.1",
+  "author": {
+    "name": "Hephaestus-Zero",
+    "url": "https://github.com/Hephaestus-Zero"
+  },
+  "repository": "https://github.com/Hephaestus-Zero/hslice",
+  "license": "MIT"
+}

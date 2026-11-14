@@ -6,7 +6,32 @@
 
 `hslice` is a zero-dependency C11 structural code slicer and `mmap` 3-gram index engine (`hslice`, `hfind`, `hsearch`) built for **Claude Code**, **OpenAI Codex**, **Cursor**, **Gemini CLI**, and local developer workflows. Instead of forcing coding agents to spend 4–6 tool turns running `find`, `grep`, and reading entire 1,000-line files into context, `hslice` slices the exact symbol definition, enclosing traceback function, structural skeleton, or definition-plus-callers (`-x`) in **one call** — cutting context token consumption by **93–96%** at **~1.3–2.3 ms** steady-state latency.
 
+![hslice animated terminal demo](assets/demo.svg)
+
 ![hslice token economy and latency benchmark](assets/benchmark.svg)
+
+## Quick Install
+
+- **Homebrew (macOS Apple Silicon & Linux):**
+  ```bash
+  brew install Hephaestus-Zero/tap/hslice
+  ```
+- **Agent Skill (Claude Code, Cursor, Codex, Antigravity):**
+  ```bash
+  npx skills add Hephaestus-Zero/hslice
+  ```
+- **Claude Code Plugin:**
+  ```text
+  /plugin marketplace add Hephaestus-Zero/hslice
+  ```
+- **Python / `pip` / `uvx`:**
+  ```bash
+  pip install git+https://github.com/Hephaestus-Zero/hslice.git
+  ```
+- **Prebuilt Binary (`x86_64` Linux & `arm64` macOS):**
+  ```bash
+  curl -fsSL https://raw.githubusercontent.com/Hephaestus-Zero/hslice/main/install.sh | sh
+  ```
 
 ## Why Agents Waste Tokens (And How `hslice` Fixes It)
 
@@ -105,7 +130,7 @@ uvx --from git+https://github.com/Hephaestus-Zero/hslice.git hslice --version
 ### Option D: GitHub Actions
 
 ```yaml
-- uses: Hephaestus-Zero/hslice@v0.1.0
+- uses: Hephaestus-Zero/hslice@v0.1.1
 ```
 
 ## Coding-Agent Drop-In Setup

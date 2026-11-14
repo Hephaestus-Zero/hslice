@@ -1,0 +1,79 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 880 400" width="880" height="400" role="img" aria-label="hslice animated terminal demo">
+  <defs>
+    <linearGradient id="termBg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#0d1117"/>
+      <stop offset="100%" stop-color="#121821"/>
+    </linearGradient>
+    <style>
+      .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; font-size: 13px; }
+      .sm { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; font-size: 12px; }
+      .sans { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif; }
+      @keyframes step1 { 0%, 4% { opacity: 0; } 8%, 92% { opacity: 1; } 98%, 100% { opacity: 0; } }
+      @keyframes step2 { 0%, 14% { opacity: 0; } 19%, 92% { opacity: 1; } 98%, 100% { opacity: 0; } }
+      @keyframes step3 { 0%, 26% { opacity: 0; } 31%, 92% { opacity: 1; } 98%, 100% { opacity: 0; } }
+      @keyframes step4 { 0%, 42% { opacity: 0; } 48%, 92% { opacity: 1; } 98%, 100% { opacity: 0; } }
+      @keyframes blink { 0%, 49% { opacity: 1; } 50%, 100% { opacity: 0; } }
+      .s1 { animation: step1 8.5s infinite; }
+      .s2 { animation: step2 8.5s infinite; }
+      .s3 { animation: step3 8.5s infinite; }
+      .s4 { animation: step4 8.5s infinite; }
+      .cursor { animation: blink 1s step-end infinite; }
+    </style>
+  </defs>
+
+  <rect width="880" height="400" rx="12" fill="url(#termBg)" stroke="#30363d" stroke-width="1.2"/>
+
+  <!-- Window chrome -->
+  <rect width="880" height="36" rx="12" fill="#161b22"/>
+  <rect y="24" width="880" height="12" fill="#161b22"/>
+  <line x1="0" y1="36" x2="880" y2="36" stroke="#21262d" stroke-width="1"/>
+  <circle cx="22" cy="18" r="5.5" fill="#ff5f56"/>
+  <circle cx="40" cy="18" r="5.5" fill="#ffbd2e"/>
+  <circle cx="58" cy="18" r="5.5" fill="#27c93f"/>
+  <text x="440" y="22" text-anchor="middle" fill="#8b949e" class="sm">zsh — hslice v0.1.1 (C11 mmap trigram + AST slicer)</text>
+
+  <!-- Step 1: Prompt & command -->
+  <g class="s1">
+    <text x="24" y="66" class="mono">
+      <tspan fill="#3fb950">~/projects/hshield</tspan>
+      <tspan fill="#8b949e"> $ </tspan>
+      <tspan fill="#f0f6fc" font-weight="600">hslice -x cmd_sandbox_impl</tspan>
+    </text>
+    <rect x="404" y="54" width="7" height="15" fill="#58a6ff" class="cursor"/>
+  </g>
+
+  <!-- Step 2: Header & Latency -->
+  <g class="s2">
+    <rect x="24" y="80" width="832" height="26" rx="5" fill="#1f6feb" fill-opacity="0.14" stroke="#388bfd" stroke-opacity="0.35"/>
+    <text x="34" y="97" class="sm" fill="#79c0ff">=== SLICE src/hshield.c:412-498 [fn cmd_sandbox_impl] · trigram lookup 1.7 ms ===</text>
+  </g>
+
+  <!-- Step 3: Exact Sliced AST Body -->
+  <g class="s3">
+    <text x="24" y="128" class="sm" fill="#8b949e">412 | <tspan fill="#ff7b72">static int</tspan> <tspan fill="#d2a8ff">cmd_sandbox_impl</tspan><tspan fill="#e6edf3">(int argc, char **argv) {</tspan></text>
+    <text x="24" y="148" class="sm" fill="#8b949e">413 | <tspan fill="#e6edf3">    struct landlock_ruleset_attr attr = { .handled_access_fs = FS_ALL, ... };</tspan></text>
+    <text x="24" y="168" class="sm" fill="#8b949e">414 | <tspan fill="#e6edf3">    if (deny_net) attr.handled_access_net = LANDLOCK_ACCESS_NET_BIND_TCP | CONNECT_TCP;</tspan></text>
+    <text x="24" y="188" class="sm" fill="#8b949e">415 | <tspan fill="#e6edf3">    int ruleset = landlock_create_ruleset(&amp;attr, sizeof(attr), 0);</tspan></text>
+    <text x="24" y="208" class="sm" fill="#8b949e">497 | <tspan fill="#e6edf3">    execvp(argv[cmd_idx], &amp;argv[cmd_idx]);</tspan></text>
+    <text x="24" y="228" class="sm" fill="#8b949e">498 | <tspan fill="#e6edf3">}</tspan></text>
+
+    <text x="24" y="256" class="sm" fill="#58a6ff">=== REFERENCES cmd_sandbox_impl (2 callers, single shot) ===</text>
+    <text x="24" y="276" class="sm" fill="#e6edf3">src/hshield.c:521:    if (agent_mode) return cmd_sandbox_impl(argc, argv);</text>
+    <text x="24" y="296" class="sm" fill="#e6edf3">src/hshield.c:588:    if (strcmp(argv[1], "sandbox") == 0) return cmd_sandbox_impl(argc, argv);</text>
+  </g>
+
+  <!-- Step 4: Bottom Token Comparison Pill -->
+  <g class="s4">
+    <rect x="24" y="320" width="832" height="58" rx="8" fill="#161b22" stroke="#2ea043" stroke-opacity="0.55"/>
+    <text x="40" y="343" class="sans" font-size="13" font-weight="600" fill="#8b949e">
+      4-Turn Baseline (find + grep + full-file read + caller grep):
+      <tspan fill="#ffa198">36,517 tokens · 4 agent turns</tspan>
+    </text>
+    <text x="40" y="365" class="sans" font-size="13.5" font-weight="700" fill="#3fb950">
+      hslice -x (1-Shot Structural Slice + Callers):
+      <tspan fill="#7ee787">1,384 tokens · 1 agent turn · -96.2% tokens saved</tspan>
+    </text>
+    <rect x="742" y="331" width="98" height="36" rx="6" fill="#238636"/>
+    <text x="791" y="354" text-anchor="middle" class="mono" font-weight="700" fill="#ffffff">-96.2%</text>
+  </g>
+</svg>

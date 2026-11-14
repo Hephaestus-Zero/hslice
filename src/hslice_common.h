@@ -29,7 +29,7 @@
 #define PATH_MAX 4096
 #endif
 
-#define HSLICE_VERSION "0.1.0"
+#define HSLICE_VERSION "0.1.1"
 #define HSLICE_MAX_ROOTS 16
 
 static inline const char *ci_strstr(const char *haystack, const char *needle) {

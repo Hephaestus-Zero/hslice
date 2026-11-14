@@ -1,0 +1,14 @@
+{
+  "name": "hephaestus-zero",
+  "owner": {
+    "name": "Hephaestus-Zero",
+    "url": "https://github.com/Hephaestus-Zero"
+  },
+  "plugins": [
+    {
+      "name": "hslice",
+      "source": "./",
+      "description": "Sub-2ms C11 mmap trigram code indexer and structural AST symbol slicer (-94% file-read tokens)"
+    }
+  ]
+}
